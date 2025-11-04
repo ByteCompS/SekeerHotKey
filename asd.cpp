@@ -18,10 +18,15 @@
 #include <locale>
 #include <codecvt>
 #include <random>
+#include <tlhelp32.h>
+#include <psapi.h>
+#include <wininet.h>
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "wininet.lib")
 
 #define IDI_SEEKER 100
 #define IDD_INSTALLER 101
@@ -38,6 +43,8 @@
 #define VK_K 0x4B
 
 std::map<int, std::vector<std::string>> keyCommands;
+std::map<std::string, std::map<int, std::vector<std::string>>> windowKeyCommands;
+std::string currentCapturedWindow;
 HHOOK keyboardHook = NULL;
 NOTIFYICONDATA nid = {0};
 HWND hwnd = NULL;
@@ -45,8 +52,107 @@ std::atomic<bool> running(true);
 std::atomic<bool> isPaused(false);
 std::thread scriptThread;
 HINSTANCE hInstance;
+std::map<std::string, int> variables;
+std::map<DWORD, HANDLE> processHandles;
 
 void executeScriptWithBindings(const std::wstring& filename, std::set<std::wstring>& includedFiles);
+
+DWORD GetProcessIdByName(const std::string& processName) {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return 0;
+
+    PROCESSENTRY32 pe;
+    pe.dwSize = sizeof(PROCESSENTRY32);
+
+    if (Process32First(hSnapshot, &pe)) {
+        do {
+            std::wstring wname(pe.szExeFile);
+            std::string name(wname.begin(), wname.end());
+            if (name == processName) {
+                CloseHandle(hSnapshot);
+                return pe.th32ProcessID;
+            }
+        } while (Process32Next(hSnapshot, &pe));
+    }
+
+    CloseHandle(hSnapshot);
+    return 0;
+}
+
+HANDLE GetProcessHandle(DWORD pid) {
+    if (processHandles.find(pid) != processHandles.end()) {
+        return processHandles[pid];
+    }
+    
+    HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+    if (hProcess) {
+        processHandles[pid] = hProcess;
+    }
+    return hProcess;
+}
+
+BOOL ReadMemory(DWORD pid, DWORD_PTR address, LPVOID buffer, SIZE_T size) {
+    HANDLE hProcess = GetProcessHandle(pid);
+    if (!hProcess) return FALSE;
+    
+    SIZE_T bytesRead;
+    return ReadProcessMemory(hProcess, (LPCVOID)address, buffer, size, &bytesRead);
+}
+
+BOOL WriteMemory(DWORD pid, DWORD_PTR address, LPVOID buffer, SIZE_T size) {
+    HANDLE hProcess = GetProcessHandle(pid);
+    if (!hProcess) return FALSE;
+    
+    SIZE_T bytesWritten;
+    return WriteProcessMemory(hProcess, (LPVOID)address, buffer, size, &bytesWritten);
+}
+
+HWND FindWindowByTitle(const std::string& title) {
+    return FindWindowA(NULL, title.c_str());
+}
+
+BOOL IsWindowActive(HWND hwnd) {
+    return GetForegroundWindow() == hwnd;
+}
+
+void OpenWebsite(const std::string& url) {
+    ShellExecuteA(NULL, "open", url.c_str(), NULL, NULL, SW_SHOWNORMAL);
+}
+
+void OpenApplication(const std::string& appPath) {
+    ShellExecuteA(NULL, "open", appPath.c_str(), NULL, NULL, SW_SHOWNORMAL);
+}
+
+void SystemShutdown(int seconds) {
+    std::string cmd = "shutdown /s /t " + std::to_string(seconds);
+    system(cmd.c_str());
+}
+
+void SystemRestart(int seconds) {
+    std::string cmd = "shutdown /r /t " + std::to_string(seconds);
+    system(cmd.c_str());
+}
+
+void SystemSleep() {
+    SetSystemPowerState(TRUE, FALSE);
+}
+
+void SystemHibernate() {
+    SetSystemPowerState(FALSE, TRUE);
+}
+
+void SetVolume(int volume) {
+    int value = volume * 655.35;
+    waveOutSetVolume(0, value | (value << 16));
+}
+
+void ScrollMouse(int clicks) {
+    INPUT input = {0};
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = MOUSEEVENTF_WHEEL;
+    input.mi.mouseData = clicks * WHEEL_DELTA;
+    SendInput(1, &input, sizeof(INPUT));
+}
 
 BOOL CreateShortcut(LPCWSTR targetPath, LPCWSTR shortcutPath, LPCWSTR description) {
     CoInitialize(NULL);
@@ -74,7 +180,6 @@ void uninstall() {
     HKEY hKey;
 
     RegDeleteKeyW(HKEY_CLASSES_ROOT, L".sekeer");
-
     RegDeleteKeyW(HKEY_CLASSES_ROOT, L"SeekerScript");
 
     WCHAR startMenuPath[MAX_PATH];
@@ -338,6 +443,90 @@ void executeLoop(const std::vector<std::string>& commands, int iterations) {
                     Sleep(100);
                 }
             }
+            else if (command == "open" || command == "start" || command == "launch" || command == "run" || command == "execute" ||
+                     command == "app" || command == "program" || command == "process" || command == "start_app" || command == "launch_app") {
+                std::string appPath;
+                std::getline(iss, appPath);
+                appPath.erase(appPath.begin(), std::find_if(appPath.begin(), appPath.end(), [](int ch) { return !std::isspace(ch); }));
+                OpenApplication(appPath);
+            }
+            else if (command == "website" || command == "url" || command == "browser" || command == "web" || command == "open_site" ||
+                     command == "open_url" || command == "navigate" || command == "go_to" || command == "visit" || command == "surf") {
+                std::string url;
+                std::getline(iss, url);
+                url.erase(url.begin(), std::find_if(url.begin(), url.end(), [](int ch) { return !std::isspace(ch); }));
+                OpenWebsite(url);
+            }
+            else if (command == "shutdown" || command == "poweroff" || command == "turn_off" || command == "shut_down") {
+                int seconds;
+                iss >> seconds;
+                SystemShutdown(seconds);
+            }
+            else if (command == "restart" || command == "reboot" || command == "restart_pc") {
+                int seconds;
+                iss >> seconds;
+                SystemRestart(seconds);
+            }
+            else if (command == "sleep_pc" || command == "sleep_computer") {
+                int seconds;
+                iss >> seconds;
+                Sleep(seconds * 1000);
+                SystemSleep();
+            }
+            else if (command == "hibernate") {
+                int seconds;
+                iss >> seconds;
+                Sleep(seconds * 1000);
+                SystemHibernate();
+            }
+            else if (command == "scroll" || command == "wheel_up" || command == "wheel_down") {
+                int clicks;
+                iss >> clicks;
+                ScrollMouse(clicks);
+            }
+            else if (command == "set_volume" || command == "volume") {
+                int volume;
+                iss >> volume;
+                SetVolume(volume);
+            }
+            else if (command == "read_memory" || command == "readmem") {
+                std::string addressStr;
+                iss >> addressStr;
+                DWORD_PTR address = std::stoul(addressStr, nullptr, 16);
+                
+                std::string varName;
+                iss >> varName;
+                
+                if (varName[0] == '$') {
+                    DWORD pid = GetProcessIdByName(currentCapturedWindow);
+                    if (pid != 0) {
+                        int value;
+                        if (ReadMemory(pid, address, &value, sizeof(value))) {
+                            variables[varName] = value;
+                        }
+                    }
+                }
+            }
+            else if (command == "write_memory" || command == "writemem") {
+                std::string addressStr;
+                iss >> addressStr;
+                DWORD_PTR address = std::stoul(addressStr, nullptr, 16);
+                
+                std::string valueStr;
+                iss >> valueStr;
+                
+                int value;
+                if (valueStr[0] == '$') {
+                    value = variables[valueStr];
+                } else {
+                    value = std::stoi(valueStr);
+                }
+                
+                DWORD pid = GetProcessIdByName(currentCapturedWindow);
+                if (pid != 0) {
+                    WriteMemory(pid, address, &value, sizeof(value));
+                }
+            }
         }
     }
 }
@@ -345,6 +534,106 @@ void executeLoop(const std::vector<std::string>& commands, int iterations) {
 LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode >= 0 && wParam == WM_KEYDOWN) {
         KBDLLHOOKSTRUCT* p = (KBDLLHOOKSTRUCT*)lParam;
+        
+        if (!currentCapturedWindow.empty()) {
+            HWND targetWindow = FindWindowByTitle(currentCapturedWindow);
+            if (targetWindow && IsWindowActive(targetWindow)) {
+                auto windowIt = windowKeyCommands.find(currentCapturedWindow);
+                if (windowIt != windowKeyCommands.end()) {
+                    auto it = windowIt->second.find(p->vkCode);
+                    if (it != windowIt->second.end()) {
+                        std::thread([it]() {
+                            for (const auto& cmd : it->second) {
+                                if (!running) break;
+                                while (isPaused && running) {
+                                    Sleep(100);
+                                }
+
+                                std::istringstream iss(cmd);
+                                std::string command;
+                                iss >> command;
+
+                                if (command == "hypersleep" || command == "sleep" || command == "wait" || 
+                                    command == "delay" || command == "pause" || command == "rest" || command == "halt" ||
+                                    command == "stop" || command == "break" || command == "idle" || command == "nap" ||
+                                    command == "slumber" || command == "doze" || command == "snooze" || command == "resting" ||
+                                    command == "waiting" || command == "pausing" || command == "delaying" || command == "sleeping" ||
+                                    command == "hibernation" || command == "suspension" || command == "intermission" || command == "timeout" ||
+                                    command == "interval" || command == "gap" || command == "pause_time" || command == "wait_time" ||
+                                    command == "delay_time" || command == "rest_time" || command == "break_time" || command == "idle_time" ||
+                                    command == "nap_time" || command == "slumber_time" || command == "doze_time" || command == "snooze_time" ||
+                                    command == "waiting_time" || command == "pausing_time" || command == "delaying_time" || command == "sleeping_time" ||
+                                    command == "hibernation_time" || command == "suspension_time" || command == "intermission_time" || command == "timeout_time" ||
+                                    command == "interval_time" || command == "gap_time" || command == "pause_duration" || command == "wait_duration") {
+                                    int ms;
+                                    iss >> ms;
+                                    Sleep(ms);
+                                }
+                                else if (command == "send" || command == "type" || command == "write" ||
+                                         command == "input" || command == "enter" || command == "press" || command == "key" ||
+                                         command == "text" || command == "string" || command == "output" || command == "print" ||
+                                         command == "display" || command == "show" || command == "emit" || command == "transmit" ||
+                                         command == "transfer" || command == "communicate" || command == "convey" || command == "express" ||
+                                         command == "send_text" || command == "type_text" || command == "write_text" || command == "input_text" ||
+                                         command == "enter_text" || command == "press_text" || command == "key_text" || command == "text_input" ||
+                                         command == "string_input" || command == "output_text" || command == "print_text" || command == "display_text" ||
+                                         command == "show_text" || command == "emit_text" || command == "transmit_text" || command == "transfer_text" ||
+                                         command == "communicate_text" || command == "convey_text" || command == "express_text" || command == "typing" ||
+                                         command == "writing" || command == "entering" || command == "pressing" || command == "inputting" ||
+                                         command == "outputting" || command == "printing" || command == "displaying" || command == "showing") {
+                                    std::string text;
+                                    std::getline(iss, text);
+                                    text.erase(text.begin(), std::find_if(text.begin(), text.end(), [](int ch) { return !std::isspace(ch); }));
+                                    sendKeys(text);
+                                }
+                                else if (command == "mouse" || command == "move_mouse" || command == "cursor" ||
+                                         command == "pointer" || command == "mouse_move" || command == "cursor_move" || command == "pointer_move" ||
+                                         command == "move_cursor" || command == "move_pointer" || command == "set_mouse" || command == "set_cursor" ||
+                                         command == "set_pointer" || command == "position_mouse" || command == "position_cursor" || command == "position_pointer" ||
+                                         command == "rel_mouse" || command == "relative_mouse" || command == "rel_cursor" || command == "relative_cursor" ||
+                                         command == "rel_pointer" || command == "relative_pointer" || command == "offset_mouse" || command == "offset_cursor") {
+                                    int x, y;
+                                    iss >> x >> y;
+                                    moveMouse(x, y, false);
+                                }
+                                else if (command == "absolute_mouse" || command == "abs_mouse" || 
+                                         command == "screen_mouse" || command == "desktop_mouse" || command == "display_mouse" ||
+                                         command == "abs_cursor" || command == "absolute_cursor" || command == "screen_cursor" ||
+                                         command == "desktop_cursor" || command == "display_cursor" || command == "abs_pointer" ||
+                                         command == "absolute_pointer" || command == "screen_pointer" || command == "desktop_pointer" ||
+                                         command == "display_pointer" || command == "global_mouse" || command == "global_cursor" ||
+                                         command == "global_pointer" || command == "screen_position" || command == "desktop_position" ||
+                                         command == "display_position" || command == "absolute_position" || command == "global_position") {
+                                    int x, y;
+                                    iss >> x >> y;
+                                    moveMouse(x, y, true);
+                                }
+                                else if (command == "click" || command == "tap" || command == "press_mouse" ||
+                                         command == "mouse_click" || command == "cursor_click" || command == "pointer_click" ||
+                                         command == "left_click" || command == "right_click" || command == "middle_click" ||
+                                         command == "mouse_press" || command == "cursor_press" || command == "pointer_press" ||
+                                         command == "click_left" || command == "click_right" || command == "click_middle" ||
+                                         command == "mouse_left" || command == "mouse_right" || command == "mouse_middle" ||
+                                         command == "cursor_left" || command == "cursor_right" || command == "cursor_middle" ||
+                                         command == "pointer_left" || command == "pointer_right" || command == "pointer_middle" ||
+                                         command == "left_button" || command == "right_button" || command == "middle_button" ||
+                                         command == "lclick" || command == "rclick" || command == "mclick" || command == "lpress" ||
+                                         command == "rpress" || command == "mpress" || command == "left_press" || command == "right_press" ||
+                                         command == "middle_press" || command == "button_left" || command == "button_right" || command == "button_middle") {
+                                    std::string button;
+                                    iss >> button;
+                                    clickMouse(button, true);
+                                    Sleep(10);
+                                    clickMouse(button, false);
+                                }
+                            }
+                        }).detach();
+                        return 1;
+                    }
+                }
+            }
+        }
+        
         auto it = keyCommands.find(p->vkCode);
         if (it != keyCommands.end()) {
             std::thread([it]() {
@@ -507,6 +796,7 @@ void executeScriptWithBindings(const std::wstring& filename, std::set<std::wstri
     std::vector<std::string> loopCommands;
     bool inLoop = false;
     int loopIterations = 0;
+    std::string currentWindowCapture;
 
     while (std::getline(file, wline) && running) {
         size_t commentPos = wline.find(L'#');
@@ -569,8 +859,22 @@ void executeScriptWithBindings(const std::wstring& filename, std::set<std::wstri
                 }
                 keyCommands[currentKey] = std::vector<std::string>();
             }
+        } else if (command == "capture") {
+            std::string windowName;
+            std::getline(iss, windowName);
+            windowName.erase(windowName.begin(), std::find_if(windowName.begin(), windowName.end(), [](int ch) { return !std::isspace(ch); }));
+            if (windowName.back() == ':') {
+                windowName.pop_back();
+            }
+            currentWindowCapture = windowName;
+            currentCapturedWindow = windowName;
+            windowKeyCommands[windowName] = std::map<int, std::vector<std::string>>();
         } else if (command == "::") {
             currentKey = -1;
+            currentWindowCapture.clear();
+            currentCapturedWindow.clear();
+        } else if (!currentWindowCapture.empty() && currentKey != -1) {
+            windowKeyCommands[currentWindowCapture][currentKey].push_back(line);
         } else if (currentKey != -1) {
             keyCommands[currentKey].push_back(line);
         } else if (command == "loop") {
@@ -680,6 +984,97 @@ void executeScriptWithBindings(const std::wstring& filename, std::set<std::wstri
                 }
                 sendKeys(line);
                 Sleep(100);
+            }
+        }
+        else if (command == "open" || command == "start" || command == "launch" || command == "run" || command == "execute" ||
+                 command == "app" || command == "program" || command == "process" || command == "start_app" || command == "launch_app") {
+            std::string appPath;
+            std::getline(iss, appPath);
+            appPath.erase(appPath.begin(), std::find_if(appPath.begin(), appPath.end(), [](int ch) { return !std::isspace(ch); }));
+            OpenApplication(appPath);
+        }
+        else if (command == "website" || command == "url" || command == "browser" || command == "web" || command == "open_site" ||
+                 command == "open_url" || command == "navigate" || command == "go_to" || command == "visit" || command == "surf") {
+            std::string url;
+            std::getline(iss, url);
+            url.erase(url.begin(), std::find_if(url.begin(), url.end(), [](int ch) { return !std::isspace(ch); }));
+            OpenWebsite(url);
+        }
+        else if (command == "shutdown" || command == "poweroff" || command == "turn_off" || command == "shut_down") {
+            int seconds;
+            iss >> seconds;
+            SystemShutdown(seconds);
+        }
+        else if (command == "restart" || command == "reboot" || command == "restart_pc") {
+            int seconds;
+            iss >> seconds;
+            SystemRestart(seconds);
+        }
+        else if (command == "sleep_pc" || command == "sleep_computer") {
+            int seconds;
+            iss >> seconds;
+            Sleep(seconds * 1000);
+            SystemSleep();
+        }
+        else if (command == "hibernate") {
+            int seconds;
+            iss >> seconds;
+            Sleep(seconds * 1000);
+            SystemHibernate();
+        }
+        else if (command == "scroll" || command == "wheel_up" || command == "wheel_down") {
+            int clicks;
+            iss >> clicks;
+            ScrollMouse(clicks);
+        }
+        else if (command == "set_volume" || command == "volume") {
+            int volume;
+            iss >> volume;
+            SetVolume(volume);
+        }
+        else if (command == "set") {
+            std::string varName;
+            iss >> varName;
+            int value;
+            iss >> value;
+            variables[varName] = value;
+        }
+        else if (command == "read_memory" || command == "readmem") {
+            std::string addressStr;
+            iss >> addressStr;
+            DWORD_PTR address = std::stoul(addressStr, nullptr, 16);
+            
+            std::string varName;
+            iss >> varName;
+            
+            if (varName[0] == '$') {
+                DWORD pid = GetProcessIdByName(currentCapturedWindow);
+                if (pid != 0) {
+                    int value;
+                    if (ReadMemory(pid, address, &value, sizeof(value))) {
+                        variables[varName] = value;
+                    }
+                }
+            }
+        }
+        else if (command == "write_memory" || command == "writemem") {
+            std::string addressStr;
+            iss >> addressStr;
+            DWORD_PTR address = std::stoul(addressStr, nullptr, 16);
+            
+            std::string valueStr;
+            iss >> valueStr;
+            
+            int value;
+            if (valueStr[0] == '$') {
+                value = variables[valueStr];
+            } else {
+                value = std::stoi(valueStr);
+            }
+            
+            DWORD pid = GetProcessIdByName(currentCapturedWindow);
+            if (pid != 0) {
+                WriteMemory(pid, address, &value, sizeof(value));
             }
         }
     }
